@@ -1,79 +1,36 @@
-# Pair Watch (Robinhood Stock Tokens)
+# Pair Watch (RH meme × stock-token)
 
-Terminal watcher for **new official Robinhood Stock Tokens** — tokens that are
-legitimately tied to an underlying stock/ETF in Robinhood's public registry.
+Finds **new low-mcap Robinhood Chain memes** verifiably tied to an official
+Robinhood Stock Token: the meme is the **base**, the stock token is the **quote**.
 
-This does **not** watch meme coins that merely *look* like a ticker name.
-Source of truth: `https://api.robinhood.com/rhj/assets`
+Example from Sep 3 night: **A Meme Coin** (`$MEME`) paired against
+`AMC Entertainment • Robinhood Token` — not the multi-million AMC stock token
+itself, and not random ticker cosplay.
 
-Prints hits in your CMD/terminal. Optional webhook. No wallets, no keys, no auto-buy.
-
-## Requirements
-
-- Python 3.9+
-- Internet
-- No `pip` packages (stdlib only)
+Registry: `https://api.robinhood.com/rhj/assets`
 
 ## Quick start
 
-**Windows (CMD)**
-
-```bat
-cd Pair_Watch
-run.bat
-```
-
-Or:
+**Windows:** `run.bat`  
+**Mac/Linux:** `./run.sh`
 
 ```bat
 python watch.py --seed
 python watch.py --daemon
 ```
 
-**Mac / Linux**
+## Filters
 
-```bash
-cd Pair_Watch
-chmod +x run.sh
-./run.sh
-```
+- Quote side ∈ official RH stock-token registry; base = meme
+- Pair age ≤ **60 minutes** (catch as they list)
+- Meme mcap **$10k–$1M** (skip multi-millions)
+- Liquidity ≥ $5k
+- Skip 5m knife (≤ -25%)
+- Skip stables (USDG/WETH/…) as the “meme”
+- **One scan only** per meme CA — you decide after
 
-## Commands
-
-| Command | What it does |
-|--------|----------------|
-| `python watch.py --seed` | Mark current registry tokens as seen (no spam) |
-| `python watch.py --once` | One scan; print new hits as JSON |
-| `python watch.py --daemon` | Keep watching (default poll 90s) |
-
-## Filters (defaults)
-
-- Official Robinhood Stock Token contracts only (registry)
-- Liquidity ≥ $10,000 (when a Dex pair exists)
-- Market cap ≥ $20,000 (when a Dex pair exists)
-- Pair age ≤ 60 minutes (under 1 hour)
-- Skip if 5m change ≤ -25%
-- Also pings when a **new token is added to the official registry**
-
-**One scan only:** each official token address is evaluated once. After that it is never rescanned — you trace and decide.
-
-Override with env vars:
-
-```bat
-set RH_MIN_LIQ=15000
-set RH_MIN_MCAP=30000
-set RH_MAX_AGE_MIN=60
-set RH_POLL_S=60
-```
-
-## Optional webhook
-
-Create `webhook.url` in this folder with one HTTPS URL on the first line. Each new hit POSTs JSON to that URL.
-
-## Runtime files
-
-Created automatically while running: `seen.json`, `last_hits.json`, `state.json`, `registry.json`, `watch.log`.
+Env: `RH_MIN_LIQ` `RH_MIN_MCAP` `RH_MAX_MCAP` `RH_MAX_AGE_MIN` `RH_POLL_S`
 
 ## Disclaimer
 
-Public data from Robinhood RHJ assets + DexScreener. Research / education only. Not financial advice. Stock tokens are not the underlying equity.
+Research only. Not financial advice. Official stock tokens ≠ underlying equity.
