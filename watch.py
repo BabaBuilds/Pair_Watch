@@ -54,8 +54,8 @@ NAME_HINTS = re.compile(
 
 MIN_LIQ_USD = float(os.environ.get("RH_MIN_LIQ", "10000"))
 MIN_MCAP_USD = float(os.environ.get("RH_MIN_MCAP", "20000"))
-MAX_AGE_MIN = float(os.environ.get("RH_MAX_AGE_MIN", os.environ.get("RH_MAX_AGE_H", "5")))
-MAX_AGE_H = MAX_AGE_MIN / 60.0  # default 5 minutes; RH_MAX_AGE_MIN overrides
+MAX_AGE_MIN = float(os.environ.get("RH_MAX_AGE_MIN", os.environ.get("RH_MAX_AGE_H", "60")))
+MAX_AGE_H = MAX_AGE_MIN / 60.0  # default 60 minutes; RH_MAX_AGE_MIN overrides
 POLL_S = int(os.environ.get("RH_POLL_S", "90"))
 UA = {"User-Agent": "Mozilla/5.0 rh-watch/1.0", "Accept": "application/json"}
 

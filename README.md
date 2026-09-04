@@ -48,7 +48,7 @@ chmod +x run.sh
 - Stock / ETF-named tickers only
 - Liquidity ≥ $10,000
 - Market cap ≥ $20,000
-- Pair age ≤ 5 minutes
+- Pair age ≤ 60 minutes (under 1 hour)
 - Skip if 5m change ≤ -25%
 
 Override with env vars:
@@ -56,7 +56,7 @@ Override with env vars:
 ```bat
 set RH_MIN_LIQ=15000
 set RH_MIN_MCAP=30000
-set RH_MAX_AGE_MIN=5
+set RH_MAX_AGE_MIN=60
 set RH_POLL_S=60
 ```
 
