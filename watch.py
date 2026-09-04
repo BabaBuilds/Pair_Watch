@@ -151,8 +151,37 @@ def fetch_pairs(addrs: list[str]) -> list[dict]:
     return out
 
 
-def evaluate_pair(p: dict, registry: dict[str, dict]) -> dict | None:
-    """Return a hit for the MEME side if pair is meme <-> official stock token."""
+def meme_mcap_from_pairs(meme_addr: str, pairs: list[dict]) -> float:
+    """Best marketCap from pairs where meme is baseToken (Dex mcap is base-sided)."""
+    best = 0.0
+    best_liq = -1.0
+    k = meme_addr.lower()
+    for p in pairs:
+        if str(p.get("chainId") or "").lower() != "robinhood":
+            continue
+        base = p.get("baseToken") or {}
+        if (base.get("address") or "").lower() != k:
+            continue
+        try:
+            liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        except Exception:
+            liq = 0.0
+        try:
+            mcap = float(p.get("marketCap") or p.get("fdv") or 0)
+        except Exception:
+            mcap = 0.0
+        if liq >= best_liq and mcap > 0:
+            best_liq = liq
+            best = mcap
+    return best
+
+
+def evaluate_pair(p: dict, registry: dict[str, dict], mcap_hint: float | None = None) -> dict | None:
+    """Hit when meme is paired with an official RH stock token (either orientation).
+
+    Last night's $MEME (0x385f4f8…) was AMC(official)/MEME — stock as base, meme as quote.
+    Smaller clones were often MEME/AMC — meme as base. Catch both.
+    """
     base = p.get("baseToken") or {}
     quote = p.get("quoteToken") or {}
     ba = (base.get("address") or "").lower()
@@ -162,16 +191,20 @@ def evaluate_pair(p: dict, registry: dict[str, dict]) -> dict | None:
 
     base_off = ba in registry
     quote_off = qa in registry
-    # Require quote = official stock token, base = meme.
-    # Dex marketCap is for baseToken — this keeps mcap correct
-    # (same pattern as "A Meme Coin" / AMC last night).
-    if not quote_off or base_off:
-        return None
+    if base_off == quote_off:
+        return None  # both official or neither
 
-    meme, stock_meta = base, registry[qa]
-    meme_addr = ba
+    if quote_off and not base_off:
+        # meme / STOCK  (meme is base — pair mcap is meme's)
+        meme, stock_meta = base, registry[qa]
+        meme_addr = ba
+        mcap_from_pair = True
+    else:
+        # STOCK / meme  (last-night $MEME style — pair mcap is the stock's, ignore it)
+        meme, stock_meta = quote, registry[ba]
+        meme_addr = qa
+        mcap_from_pair = False
 
-    # skip if meme side is somehow also official (shouldn't happen)
     if meme_addr in registry:
         return None
     sym = (meme.get("symbol") or "").strip().lower()
@@ -179,9 +212,17 @@ def evaluate_pair(p: dict, registry: dict[str, dict]) -> dict | None:
         return None
 
     try:
-        mcap = float(p.get("marketCap") or p.get("fdv") or 0)
+        pair_mcap = float(p.get("marketCap") or p.get("fdv") or 0)
     except Exception:
-        mcap = 0.0
+        pair_mcap = 0.0
+    if mcap_from_pair:
+        mcap = pair_mcap
+    elif mcap_hint is not None and mcap_hint > 0:
+        mcap = mcap_hint
+    else:
+        # defer — caller must re-eval with hint
+        mcap = -1.0
+
     try:
         liq = float((p.get("liquidity") or {}).get("usd") or 0)
     except Exception:
@@ -198,13 +239,31 @@ def evaluate_pair(p: dict, registry: dict[str, dict]) -> dict | None:
 
     if liq < MIN_LIQ_USD:
         return None
-    if mcap < MIN_MCAP_USD:
-        return None
-    if mcap > MAX_MCAP_USD:
-        return None
     if age_m is not None and age_m > MAX_AGE_MIN:
         return None
     if m5 <= -25:
+        return None
+    if mcap < 0:
+        return {
+            "_needs_mcap": True,
+            "symbol": meme.get("symbol") or "",
+            "name": meme.get("name") or "",
+            "address": meme.get("address") or "",
+            "mcap": None,
+            "liq": round(liq),
+            "age_m": round(age_m, 1) if age_m is not None else None,
+            "chg_m5": m5,
+            "chg_h1": ch.get("h1"),
+            "chg_h24": ch.get("h24"),
+            "url": p.get("url"),
+            "pair": p.get("pairAddress"),
+            "tied_stock": stock_meta.get("symbol"),
+            "tied_stock_name": stock_meta.get("name"),
+            "tied_stock_address": stock_meta.get("address"),
+            "orientation": "stock_base_meme_quote",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+    if mcap < MIN_MCAP_USD or mcap > MAX_MCAP_USD:
         return None
 
     return {
@@ -222,6 +281,7 @@ def evaluate_pair(p: dict, registry: dict[str, dict]) -> dict | None:
         "tied_stock": stock_meta.get("symbol"),
         "tied_stock_name": stock_meta.get("name"),
         "tied_stock_address": stock_meta.get("address"),
+        "orientation": "meme_base_stock_quote" if mcap_from_pair else "stock_base_meme_quote",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
 
@@ -278,6 +338,7 @@ def scan_once(seed: bool = False) -> list[dict]:
     pairs = fetch_pairs(all_addrs)
 
     best: dict[str, dict] = {}
+    need_mcap: dict[str, dict] = {}
     for p in pairs:
         row = evaluate_pair(p, registry)
         if not row:
@@ -285,9 +346,26 @@ def scan_once(seed: bool = False) -> list[dict]:
         k = row["address"].lower()
         if k in seen:
             continue
+        if row.pop("_needs_mcap", False):
+            prev = need_mcap.get(k)
+            if not prev or row["liq"] > prev["liq"]:
+                need_mcap[k] = row
+            continue
         prev = best.get(k)
         if not prev or row["liq"] > prev["liq"]:
             best[k] = row
+
+    # Resolve meme mcap when stock was base (Dex pair mcap = stock, not meme)
+    if need_mcap:
+        meme_pairs = fetch_pairs([row["address"] for row in need_mcap.values()])
+        for k, row in need_mcap.items():
+            hint = meme_mcap_from_pairs(k, meme_pairs)
+            if hint < MIN_MCAP_USD or hint > MAX_MCAP_USD:
+                continue
+            row["mcap"] = round(hint)
+            prev = best.get(k)
+            if not prev or row["liq"] > prev["liq"]:
+                best[k] = row
 
     # Mark every newly considered meme candidate as seen (one-scan), pass or fail
     for a in fresh_meme_candidates:
