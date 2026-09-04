@@ -54,7 +54,8 @@ NAME_HINTS = re.compile(
 
 MIN_LIQ_USD = float(os.environ.get("RH_MIN_LIQ", "10000"))
 MIN_MCAP_USD = float(os.environ.get("RH_MIN_MCAP", "20000"))
-MAX_AGE_H = float(os.environ.get("RH_MAX_AGE_H", "2"))  # "new" = first 2h on Dex
+MAX_AGE_MIN = float(os.environ.get("RH_MAX_AGE_MIN", os.environ.get("RH_MAX_AGE_H", "5")))
+MAX_AGE_H = MAX_AGE_MIN / 60.0  # default 5 minutes; RH_MAX_AGE_MIN overrides
 POLL_S = int(os.environ.get("RH_POLL_S", "90"))
 UA = {"User-Agent": "Mozilla/5.0 rh-watch/1.0", "Accept": "application/json"}
 
@@ -235,60 +236,83 @@ def fire_webhook(hits: list[dict]) -> None:
 
 
 def scan_once(seed: bool = False) -> list[dict]:
+    """One look per token address. Once scanned, never evaluate that CA again."""
     seen = set(load_json(SEEN, []))
     addrs = collect_candidate_addrs()
-    pairs = fetch_pairs(addrs)
-    # best pair per token
+    # only fetch / evaluate addresses we have never scanned
+    fresh_addrs = [a for a in addrs if a.lower() not in seen]
+    pairs = fetch_pairs(fresh_addrs) if fresh_addrs else []
+
+    # best pair per token (among unscanned only)
     best: dict[str, dict] = {}
     for p in pairs:
+        base = p.get("baseToken") or {}
+        addr = (base.get("address") or "").lower()
+        if not addr or addr in seen:
+            continue
         row = pair_row(p)
         if not row:
             continue
-        k = row["address"].lower()
-        prev = best.get(k)
+        prev = best.get(addr)
         if not prev or row["liq"] > prev["liq"]:
-            best[k] = row
+            best[addr] = row
 
     new_hits: list[dict] = []
+    # Mark EVERY freshly considered address as seen — pass or fail.
+    # User traces from here; we never rescan the same coin.
+    for a in fresh_addrs:
+        seen.add(a.lower())
     for k, row in best.items():
-        if k in seen:
-            continue
-        seen.add(k)
         if seed:
             continue
         new_hits.append(row)
 
     save_json(SEEN, sorted(seen))
-    save_json(HITS, {"ts": time.time(), "seed": seed, "hits": new_hits})
+    save_json(
+        HITS,
+        {
+            "ts": time.time(),
+            "seed": seed,
+            "hits": new_hits,
+            "note": "one-scan-only; user decides after ping",
+        },
+    )
     state = load_json(STATE, {})
     state.update(
         {
             "last_scan": time.time(),
             "candidates": len(addrs),
+            "fresh_unseen": len(fresh_addrs),
             "stock_named_live": len(best),
             "new_hits": len(new_hits),
             "seen": len(seen),
+            "max_age_min": MAX_AGE_MIN,
         }
     )
     save_json(STATE, state)
 
     if seed:
-        log(f"seeded seen={len(seen)} stock_named_live={len(best)}")
+        log(f"seeded seen={len(seen)} stock_named_live={len(best)} max_age_min={MAX_AGE_MIN}")
         return []
 
     if new_hits:
         log(f"NEW {len(new_hits)}: " + ", ".join(h["symbol"] for h in new_hits))
         print("\n=== RH NEW (stock-named) ===")
         for h in new_hits:
+            age_m = None if h.get("age_h") is None else round(h["age_h"] * 60, 1)
             print(
                 f"{h['symbol']}  mcap=${h['mcap']:,}  liq=${h['liq']:,}  "
-                f"age={h['age_h']}h  m5={h['chg_m5']}%\n"
+                f"age={age_m}m  m5={h['chg_m5']}%\n"
                 f"  {h['address']}\n  {h.get('url') or ''}\n"
             )
         print("============================\n")
+        print("(one-scan only — you decide from here)\n")
         fire_webhook(new_hits)
     else:
-        log(f"quiet candidates={len(addrs)} stock_named={len(best)} seen={len(seen)}")
+        log(
+            f"quiet candidates={len(addrs)} fresh={len(fresh_addrs)} "
+            f"hits={len(best)} seen={len(seen)} max_age_min={MAX_AGE_MIN}"
+        )
     return new_hits
 
 
@@ -307,7 +331,7 @@ def main():
             return
 
     if args.daemon:
-        log(f"daemon start poll={POLL_S}s min_liq={MIN_LIQ_USD} min_mcap={MIN_MCAP_USD} max_age_h={MAX_AGE_H}")
+        log(f"daemon start poll={POLL_S}s min_liq={MIN_LIQ_USD} min_mcap={MIN_MCAP_USD} max_age_min={MAX_AGE_MIN} one_scan=1")
         while True:
             try:
                 scan_once(seed=False)
