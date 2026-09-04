@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Watch DexScreener for legitimate NEW Robinhood-chain stock-named pairs.
+"""Watch for NEW official Robinhood Stock Token pairs.
 
-Pings only on first-seen hits that clear gates. No auto-buy. No FOMO %.
+Source of truth: https://api.robinhood.com/rhj/assets (194+ registry contracts).
+Name/meme ticker matching is intentionally ignored — only tokens legitimately
+tied to an underlying stock/ETF in Robinhood's registry.
+
 Usage:
-  python3 scan_new_pairs.py --once
-  python3 scan_new_pairs.py --daemon   # poll every POLL_S seconds
+  python watch.py --seed
+  python watch.py --once
+  python watch.py --daemon
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -22,42 +24,17 @@ HITS = HERE / "last_hits.json"
 LOG = HERE / "watch.log"
 WEBHOOK = HERE / "webhook.url"
 STATE = HERE / "state.json"
+REGISTRY_CACHE = HERE / "registry.json"
 
-DEX_PROFILES = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEX_BOOSTS = "https://api.dexscreener.com/token-boosts/top/v1"
+RHJ_ASSETS = "https://api.robinhood.com/rhj/assets"
 DEX_TOKENS = "https://api.dexscreener.com/latest/dex/tokens/"
-
-# Legitimate = maps to a real equity/ETF ticker (or clear stock-token branding)
-STOCK_TICKERS = {
-    "AAPL","MSFT","NVDA","AMZN","GOOG","GOOGL","META","TSLA","NFLX","AMD","INTC",
-    "AVGO","CRM","ORCL","ADBE","CSCO","QCOM","TXN","AMAT","MU","SMCI","ARM","PLTR",
-    "SNOW","NET","DDOG","CRWD","PANW","SHOP","SQ","PYPL","COIN","HOOD","MSTR","MARA",
-    "RIOT","CLS","IBM","BA","CAT","GE","DIS","NKE","SBUX","COST","WMT","TGT","HD",
-    "LOW","MCD","KO","PEP","JNJ","PFE","UNH","LLY","ABBV","MRK","JPM","BAC","WFC",
-    "C","GS","MS","V","MA","AXP","BRK","SPY","QQQ","IWM","DIA","XLF","XLE","XLK",
-    "AMC","GME","BB","NOK","BBBY","SOFI","RIVN","LCID","NIO","XPEV","LI","F","GM",
-    "RBLX","U","SNAP","PINS","UBER","LYFT","ABNB","DKNG","PENN","CZR","WYNN","MGM",
-    "CCL","RCL","NCLH","DAL","UAL","AAL","LUV","BA","RTX","LMT","NOC","GD","HON",
-    "DE","UNP","UPS","FDX","TSM","ASML","SAP","SONY","BABA","JD","PDD","BIDU",
-    "T","VZ","TMUS","CMCSA","CHTR","EA","TTWO","ATVI","SPOT","ROKU","ZM","DOCU",
-    "PATH","AI","BBAI","SOUN","IONQ","RGTI","QBTS","OPEN","COMP","Z","RDFN","EXPI",
-    "CVNA","KMX","AN","TSCO","ROST","TJX","DG","DLTR","KR","ACI","SFM","CELH","MNST",
-    "HIMS","OSCR","CLOV","TLRY","CGC","ACB","SNDL","WEED","MSOS","BITO","IBIT","FBTC",
-    "SEMI","SMH","SOXX","XBI","ARKK","ARKG","ARKW","TQQQ","SQQQ","UVXY","VIX",
-}
-
-# Extra name tokens that scream stock-token product
-NAME_HINTS = re.compile(
-    r"\b(stock|token|equity|share|nasdaq|nyse|jersey|treasury|folio|stocker)\b",
-    re.I,
-)
 
 MIN_LIQ_USD = float(os.environ.get("RH_MIN_LIQ", "10000"))
 MIN_MCAP_USD = float(os.environ.get("RH_MIN_MCAP", "20000"))
 MAX_AGE_MIN = float(os.environ.get("RH_MAX_AGE_MIN", os.environ.get("RH_MAX_AGE_H", "60")))
-MAX_AGE_H = MAX_AGE_MIN / 60.0  # default 60 minutes; RH_MAX_AGE_MIN overrides
+MAX_AGE_H = MAX_AGE_MIN / 60.0
 POLL_S = int(os.environ.get("RH_POLL_S", "90"))
-UA = {"User-Agent": "Mozilla/5.0 rh-watch/1.0", "Accept": "application/json"}
+UA = {"User-Agent": "Mozilla/5.0 PairWatch/2.0", "Accept": "application/json"}
 
 
 def log(msg: str) -> None:
@@ -67,7 +44,7 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
-def get_json(url: str, timeout: float = 20.0):
+def get_json(url: str, timeout: float = 25.0):
     req = urllib.request.Request(url, headers=UA)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -89,57 +66,41 @@ def save_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, indent=2))
 
 
-def norm_sym(s: str) -> str:
-    s = (s or "").upper().strip()
-    s = re.sub(r"[^A-Z0-9]", "", s)
-    # strip common prefixes/suffixes
-    for junk in ("TOKEN", "STOCK", "COIN", "RH", "ONCHAIN"):
-        if s.endswith(junk) and len(s) > len(junk) + 1:
-            s = s[: -len(junk)]
-    return s
-
-
-def is_stock_named(symbol: str, name: str) -> bool:
-    sym = norm_sym(symbol)
-    if sym in STOCK_TICKERS:
-        return True
-    # $TICKER in name
-    for m in re.findall(r"\$([A-Za-z]{1,5})\b", name or ""):
-        if m.upper() in STOCK_TICKERS:
-            return True
-    # whole-word ticker in name
-    up = (name or "").upper()
-    for t in STOCK_TICKERS:
-        if re.search(rf"\b{t}\b", up):
-            return True
-    # branded stock-token with a short ticker-like symbol
-    if NAME_HINTS.search(name or "") and 1 <= len(sym) <= 5 and sym.isalpha():
-        return True
-    return False
-
-
-def collect_candidate_addrs() -> list[str]:
-    addrs: list[str] = []
-    seen: set[str] = set()
-    for url in (DEX_PROFILES, DEX_BOOSTS):
-        body, err = get_json(url)
-        if err or not isinstance(body, list):
-            log(f"list fail {url}: {err}")
+def fetch_registry() -> dict[str, dict]:
+    """Map lower(contractAddress) -> asset metadata from official RHJ registry."""
+    body, err = get_json(RHJ_ASSETS)
+    if err or not isinstance(body, dict):
+        # fall back to cache
+        cached = load_json(REGISTRY_CACHE, {})
+        if cached.get("by_addr"):
+            log(f"registry fail ({err}); using cache n={len(cached['by_addr'])}")
+            return {k: v for k, v in cached["by_addr"].items()}
+        log(f"registry fail: {err}")
+        return {}
+    by_addr: dict[str, dict] = {}
+    for asset in body.get("assets") or []:
+        if not isinstance(asset, dict):
             continue
-        for row in body:
-            if not isinstance(row, dict):
+        if str(asset.get("status") or "").endswith("INACTIVE"):
+            continue
+        for dep in asset.get("deployments") or []:
+            addr = (dep.get("contractAddress") or "").strip()
+            if not addr.startswith("0x"):
                 continue
-            if str(row.get("chainId") or "").lower() != "robinhood":
-                continue
-            a = (row.get("tokenAddress") or row.get("address") or "").strip()
-            if not a.startswith("0x") or len(a) < 42:
-                continue
-            k = a.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            addrs.append(a)
-    return addrs
+            by_addr[addr.lower()] = {
+                "symbol": asset.get("tokenSymbol") or "",
+                "name": asset.get("tokenName") or "",
+                "id": asset.get("id") or "",
+                "status": asset.get("status") or "",
+                "address": addr,
+                "chainId": dep.get("chainId"),
+                "multiplier": asset.get("currentMultiplier"),
+            }
+    save_json(
+        REGISTRY_CACHE,
+        {"ts": time.time(), "n": len(by_addr), "by_addr": by_addr},
+    )
+    return by_addr
 
 
 def fetch_pairs(addrs: list[str]) -> list[dict]:
@@ -158,15 +119,9 @@ def fetch_pairs(addrs: list[str]) -> list[dict]:
     return out
 
 
-def pair_row(p: dict) -> dict | None:
+def pair_row(p: dict, meta: dict) -> dict | None:
     base = p.get("baseToken") or {}
-    sym = base.get("symbol") or ""
-    name = base.get("name") or ""
-    addr = base.get("address") or ""
-    if not addr:
-        return None
-    if not is_stock_named(sym, name):
-        return None
+    addr = base.get("address") or meta.get("address") or ""
     try:
         mcap = float(p.get("marketCap") or p.get("fdv") or 0)
     except Exception:
@@ -177,37 +132,40 @@ def pair_row(p: dict) -> dict | None:
         liq = 0.0
     created = p.get("pairCreatedAt")
     age_h = None
+    age_m = None
     if created:
         age_h = (time.time() * 1000 - float(created)) / 3_600_000
+        age_m = age_h * 60
     ch = p.get("priceChange") or {}
     try:
         m5 = float(ch.get("m5") or 0)
     except Exception:
         m5 = 0.0
 
-    # gates
     if liq < MIN_LIQ_USD:
         return None
     if mcap < MIN_MCAP_USD:
         return None
-    if age_h is not None and age_h > MAX_AGE_H:
+    if age_m is not None and age_m > MAX_AGE_MIN:
         return None
-    # knife / one-way dump
     if m5 <= -25:
         return None
 
     return {
-        "symbol": sym,
-        "name": name,
+        "symbol": meta.get("symbol") or base.get("symbol") or "",
+        "name": meta.get("name") or base.get("name") or "",
         "address": addr,
         "mcap": round(mcap),
         "liq": round(liq),
-        "age_h": round(age_h, 2) if age_h is not None else None,
+        "age_h": round(age_h, 3) if age_h is not None else None,
+        "age_m": round(age_m, 1) if age_m is not None else None,
         "chg_m5": m5,
         "chg_h1": ch.get("h1"),
         "chg_h24": ch.get("h24"),
         "url": p.get("url"),
         "pair": p.get("pairAddress"),
+        "official": True,
+        "registry_id": meta.get("id"),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
 
@@ -221,7 +179,7 @@ def fire_webhook(hits: list[dict]) -> None:
     if not url:
         log("no webhook.url — hits saved only")
         return
-    payload = json.dumps({"source": "rh-watch", "n": len(hits), "hits": hits}).encode()
+    payload = json.dumps({"source": "pair-watch", "n": len(hits), "hits": hits}).encode()
     req = urllib.request.Request(
         url,
         data=payload,
@@ -236,36 +194,72 @@ def fire_webhook(hits: list[dict]) -> None:
 
 
 def scan_once(seed: bool = False) -> list[dict]:
-    """One look per token address. Once scanned, never evaluate that CA again."""
+    """One look per official stock-token address. Never rescanned."""
     seen = set(load_json(SEEN, []))
-    addrs = collect_candidate_addrs()
-    # only fetch / evaluate addresses we have never scanned
-    fresh_addrs = [a for a in addrs if a.lower() not in seen]
+    registry = fetch_registry()
+    if not registry:
+        log("no registry — abort scan")
+        return []
+
+    # Only evaluate official contracts we have never scanned
+    fresh_addrs = [meta["address"] for k, meta in registry.items() if k not in seen]
+    # Dex needs checksum/any case — use registry address as-is
     pairs = fetch_pairs(fresh_addrs) if fresh_addrs else []
 
-    # best pair per token (among unscanned only)
-    best: dict[str, dict] = {}
+    by_addr_pairs: dict[str, list] = {}
     for p in pairs:
         base = p.get("baseToken") or {}
         addr = (base.get("address") or "").lower()
-        if not addr or addr in seen:
+        if not addr or addr not in registry:
             continue
-        row = pair_row(p)
-        if not row:
-            continue
-        prev = best.get(addr)
-        if not prev or row["liq"] > prev["liq"]:
-            best[addr] = row
+        by_addr_pairs.setdefault(addr, []).append(p)
 
     new_hits: list[dict] = []
-    # Mark EVERY freshly considered address as seen — pass or fail.
-    # User traces from here; we never rescan the same coin.
+    # Mark every freshly considered official CA as seen (pass or fail)
     for a in fresh_addrs:
         seen.add(a.lower())
-    for k, row in best.items():
-        if seed:
-            continue
-        new_hits.append(row)
+
+    for addr_l, plist in by_addr_pairs.items():
+        meta = registry[addr_l]
+        best = None
+        for p in plist:
+            row = pair_row(p, meta)
+            if not row:
+                continue
+            if not best or row["liq"] > best["liq"]:
+                best = row
+        if best and not seed:
+            new_hits.append(best)
+
+    # Also alert brand-new registry listings with no Dex pair yet (still official)
+    if not seed:
+        prev_reg = set((load_json(STATE, {}).get("registry_keys") or []))
+        if prev_reg:
+            for k, meta in registry.items():
+                if k in prev_reg:
+                    continue
+                if k in {h["address"].lower() for h in new_hits}:
+                    continue
+                # new to registry since last scan — ping even without young pair
+                new_hits.append(
+                    {
+                        "symbol": meta.get("symbol"),
+                        "name": meta.get("name"),
+                        "address": meta.get("address"),
+                        "mcap": None,
+                        "liq": None,
+                        "age_h": None,
+                        "age_m": None,
+                        "chg_m5": None,
+                        "url": None,
+                        "pair": None,
+                        "official": True,
+                        "registry_new": True,
+                        "registry_id": meta.get("id"),
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "note": "new official stock token in RH registry",
+                    }
+                )
 
     save_json(SEEN, sorted(seen))
     save_json(
@@ -274,44 +268,51 @@ def scan_once(seed: bool = False) -> list[dict]:
             "ts": time.time(),
             "seed": seed,
             "hits": new_hits,
-            "note": "one-scan-only; user decides after ping",
+            "note": "official RH stock tokens only; one-scan; user decides",
         },
     )
     state = load_json(STATE, {})
     state.update(
         {
             "last_scan": time.time(),
-            "candidates": len(addrs),
+            "registry_n": len(registry),
+            "registry_keys": sorted(registry.keys()),
             "fresh_unseen": len(fresh_addrs),
-            "stock_named_live": len(best),
             "new_hits": len(new_hits),
             "seen": len(seen),
             "max_age_min": MAX_AGE_MIN,
+            "mode": "official_stock_tokens",
         }
     )
     save_json(STATE, state)
 
     if seed:
-        log(f"seeded seen={len(seen)} stock_named_live={len(best)} max_age_min={MAX_AGE_MIN}")
+        log(f"seeded seen={len(seen)} registry={len(registry)} max_age_min={MAX_AGE_MIN}")
         return []
 
     if new_hits:
-        log(f"NEW {len(new_hits)}: " + ", ".join(h["symbol"] for h in new_hits))
-        print("\n=== RH NEW (stock-named) ===")
+        log(f"NEW {len(new_hits)}: " + ", ".join(str(h.get("symbol")) for h in new_hits))
+        print("\n=== RH OFFICIAL STOCK TOKEN ===")
         for h in new_hits:
-            age_m = None if h.get("age_h") is None else round(h["age_h"] * 60, 1)
+            age = h.get("age_m")
+            age_s = f"{age}m" if age is not None else ("registry-new" if h.get("registry_new") else "?")
+            mc = h.get("mcap")
+            liq = h.get("liq")
+            mc_s = f"${mc:,}" if isinstance(mc, int) else "n/a"
+            liq_s = f"${liq:,}" if isinstance(liq, int) else "n/a"
             print(
-                f"{h['symbol']}  mcap=${h['mcap']:,}  liq=${h['liq']:,}  "
-                f"age={age_m}m  m5={h['chg_m5']}%\n"
-                f"  {h['address']}\n  {h.get('url') or ''}\n"
+                f"{h.get('symbol')}  {h.get('name')}\n"
+                f"  mcap={mc_s}  liq={liq_s}  age={age_s}\n"
+                f"  {h.get('address')}\n"
+                f"  {h.get('url') or '(no dex pair yet)'}\n"
             )
-        print("============================\n")
-        print("(one-scan only — you decide from here)\n")
+        print("===============================\n")
+        print("(official stock token — one-scan only — you decide)\n")
         fire_webhook(new_hits)
     else:
         log(
-            f"quiet candidates={len(addrs)} fresh={len(fresh_addrs)} "
-            f"hits={len(best)} seen={len(seen)} max_age_min={MAX_AGE_MIN}"
+            f"quiet registry={len(registry)} fresh={len(fresh_addrs)} "
+            f"hits=0 seen={len(seen)} max_age_min={MAX_AGE_MIN}"
         )
     return new_hits
 
@@ -322,7 +323,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--daemon", action="store_true")
-    ap.add_argument("--seed", action="store_true", help="mark current matches seen, no ping")
+    ap.add_argument("--seed", action="store_true")
     args = ap.parse_args()
 
     if args.seed or (args.daemon and not SEEN.exists()):
@@ -331,7 +332,10 @@ def main():
             return
 
     if args.daemon:
-        log(f"daemon start poll={POLL_S}s min_liq={MIN_LIQ_USD} min_mcap={MIN_MCAP_USD} max_age_min={MAX_AGE_MIN} one_scan=1")
+        log(
+            f"daemon start poll={POLL_S}s min_liq={MIN_LIQ_USD} min_mcap={MIN_MCAP_USD} "
+            f"max_age_min={MAX_AGE_MIN} mode=official_stock_tokens one_scan=1"
+        )
         while True:
             try:
                 scan_once(seed=False)

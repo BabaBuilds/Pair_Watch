@@ -6,3 +6,4 @@ webhook.url
 __pycache__/
 *.pyc
 .DS_Store
+registry.json
