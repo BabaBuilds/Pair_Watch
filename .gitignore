@@ -1,0 +1,8 @@
+seen.json
+last_hits.json
+state.json
+watch.log
+webhook.url
+__pycache__/
+*.pyc
+.DS_Store
